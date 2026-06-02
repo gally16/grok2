@@ -50,6 +50,12 @@ services:
     volumes:
       - ./data:/app/data:ro   # 只读：取代理配置
     restart: unless-stopped
+    # 无头 Chromium 常驻页面会空转吃满核，限制 CPU 以免拖垮宿主机；
+    # 签名按需+缓存(SIGN_TTL)，限到 0.5 核足够，如签名变慢可调高
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
 
   # 如果出口 IP 不干净，可取消以下注释使用 Warp 作为落地代理
   # 启用后将 proxy.base_proxy_url 设为 socks5://warp:1080
