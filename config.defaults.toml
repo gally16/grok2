@@ -115,7 +115,7 @@ test_timeout_ms = 5000
 # 已认证的 /rest/rate-limits 探针（不烧对话额度，但走完整 Cloudflare/风控链路）：
 # 回 200 = 可服务且 latency=探针往返耗时；403/超时 = 出口被风控，踢出池。
 # 拿不到可用账号 token 时自动回退到 mihomo delay，避免空池。
-verify_with_grok = false
+verify_with_grok = true
 # grok 探针单次超时（毫秒）：跨境 + 签名 + grok 后端，比 gstatic 慢，给足余量
 grok_test_timeout_ms = 12000
 # grok 探针并发上限（受 statsig 签名机吞吐限制，不宜过高）
@@ -126,6 +126,10 @@ grok_test_tokens = 4
 # 注意 verify_with_grok 开启后此阈值比较的是 grok 探针往返耗时（含签名+跨境）：
 # <= 2000ms（2 秒）算主力，更慢但能连通的作备用。
 primary_latency_ms = 2000
+# 节点入池延迟上限（毫秒）：延迟 > 此值的节点直接不入池（连备用都不算）。
+# 0 = 不限（仅按主备分档，不剔除慢节点）。开启 verify_with_grok 时比较的是
+# grok 探针往返耗时。例：填 3000 表示只有 3 秒内能服务 grok 的节点才进池。
+max_latency_ms = 0
 
 [proxy.clearance]
 # Cloudflare clearance 模式：none | manual | flaresolverr

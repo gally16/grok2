@@ -127,7 +127,9 @@ class SubscriptionScheduler:
         except Exception as exc:
             logger.warning("subscription warm-up refresh failed: error={}", exc)
         while not self._stop.is_set():
-            interval = get_config().get_int("proxy.subscription.refresh_interval_sec", 1800)
+            interval = get_config().get_int(
+                "proxy.subscription.refresh_interval_sec", 1800
+            )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=float(interval))
                 break
@@ -144,13 +146,38 @@ class SubscriptionScheduler:
         from .subscription import get_subscription_manager
 
         manager = get_subscription_manager()
+        # Poll config at a short cadence so flipping verify_with_grok re-probes
+        # the pool within ~poll seconds instead of waiting the full interval.
+        # A toggle takes effect on the next poll (≤ poll seconds), not literally
+        # instantly; a flip-and-flip-back within one poll window is a no-op.
+        last_verify = get_config().get_bool(
+            "proxy.subscription.verify_with_grok", False
+        )
+        waited = 0
         while not self._stop.is_set():
             interval = get_config().get_int("proxy.subscription.test_interval_sec", 300)
+            # Clamp poll so a tiny test_interval_sec is still honored roughly.
+            poll = min(5, max(1, interval))
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=float(interval))
+                await asyncio.wait_for(self._stop.wait(), timeout=float(poll))
                 break
             except asyncio.TimeoutError:
                 pass
+            waited += poll
+            cur_verify = get_config().get_bool(
+                "proxy.subscription.verify_with_grok", False
+            )
+            toggled = cur_verify != last_verify
+            if toggled:
+                logger.info(
+                    "subscription verify mode changed -> re-probing now: "
+                    "verify_with_grok={}",
+                    cur_verify,
+                )
+            if not (toggled or waited >= interval):
+                continue
+            last_verify = cur_verify
+            waited = 0
             try:
                 await manager.retest()
             except asyncio.CancelledError:

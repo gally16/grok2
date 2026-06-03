@@ -229,6 +229,7 @@ class SubscriptionManager:
                 "proxy.subscription.grok_test_concurrency", 8
             ),
             "grok_tokens": cfg.get_int("proxy.subscription.grok_test_tokens", 4),
+            "max_latency_ms": cfg.get_int("proxy.subscription.max_latency_ms", 0),
         }
 
     @staticmethod
@@ -294,15 +295,18 @@ class SubscriptionManager:
             await asyncio.sleep(2)  # let mihomo bring listeners/outbounds up
 
             await self._run_test(cfg, nodes)
-            healthy = sum(1 for n in nodes if n.healthy)
-            # Build-then-swap: never overwrite a working pool with an empty one.
-            # An all-unhealthy result usually means the mihomo control plane or
-            # the test URL is transiently down, not that every upstream died.
-            if healthy == 0 and self._prev_healthy() > 0:
+            # Build-then-swap guard runs on the RAW (pre-cutoff) result: an
+            # all-unhealthy measurement usually means the mihomo control plane or
+            # test URL is transiently down, not that every upstream died.
+            if sum(1 for n in nodes if n.healthy) == 0 and self._prev_healthy() > 0:
                 logger.warning(
                     "subscription refresh produced 0 healthy nodes; keeping last-known-good pool"
                 )
                 return None
+            # Cutoff is applied after the guard — filtering to 0 here is an
+            # intentional config decision and is allowed to write through.
+            self._apply_latency_cutoff(cfg, nodes)
+            healthy = sum(1 for n in nodes if n.healthy)
             state = PoolState(
                 nodes=nodes, generated_at=now_ms(), source_count=len(cfg["urls"])
             )
@@ -325,12 +329,15 @@ class SubscriptionManager:
                 return None
             prev_healthy = sum(1 for n in state.nodes if n.healthy)
             await self._run_test(cfg, state.nodes)
-            healthy = sum(1 for n in state.nodes if n.healthy)
-            if healthy == 0 and prev_healthy > 0:
+            # Guard on raw result (see refresh): transient probe failure → keep.
+            if sum(1 for n in state.nodes if n.healthy) == 0 and prev_healthy > 0:
                 logger.warning(
                     "subscription retest produced 0 healthy nodes; keeping last-known-good pool"
                 )
                 return None
+            # Intentional cutoff applied after the guard.
+            self._apply_latency_cutoff(cfg, state.nodes)
+            healthy = sum(1 for n in state.nodes if n.healthy)
             state.generated_at = now_ms()
             self._write_pool(state)
             logger.info(
@@ -372,6 +379,41 @@ class SubscriptionManager:
 
             await asyncio.gather(*(probe(n) for n in nodes))
 
+    def pool_status(self) -> dict:
+        """Read-only snapshot of the live pool for the admin UI: when it was last
+        measured and how many nodes made it in (split into primary/backup tiers)."""
+        cfg = get_config()
+        primary_ceiling = cfg.get_int("proxy.subscription.primary_latency_ms", 2000)
+        status = {
+            "generated_at": 0,
+            "total": 0,
+            "healthy": 0,
+            "primary": 0,
+            "backup": 0,
+            "verify_with_grok": cfg.get_bool(
+                "proxy.subscription.verify_with_grok", False
+            ),
+            "max_latency_ms": cfg.get_int("proxy.subscription.max_latency_ms", 0),
+            "primary_latency_ms": primary_ceiling,
+        }
+        state = self._read_pool()
+        if state is None:
+            return status
+        healthy = [n for n in state.nodes if n.healthy]
+        primary = sum(
+            1
+            for n in healthy
+            if n.latency_ms is not None and n.latency_ms <= primary_ceiling
+        )
+        status.update(
+            generated_at=state.generated_at,
+            total=len(state.nodes),
+            healthy=len(healthy),
+            primary=primary,
+            backup=len(healthy) - primary,
+        )
+        return status
+
     async def _run_test(self, cfg: dict, nodes: list[PoolNode]) -> None:
         """Measure each node's latency + availability in place.
 
@@ -379,10 +421,38 @@ class SubscriptionManager:
         (the accurate "can this IP serve grok" signal). Falls back to the cheap
         mihomo delay test when the toggle is off, or when no account tokens are
         available (inconclusive) — so we never end up with an empty pool.
+
+        Measurement only — the ``max_latency_ms`` cutoff is applied by the caller
+        AFTER the build-then-swap guard, so an intentional config filter to 0 is
+        honored while a transient probe failure still keeps the last-known-good.
         """
-        if cfg["verify_with_grok"] and await self._verify_with_grok(cfg, nodes):
+        if not (cfg["verify_with_grok"] and await self._verify_with_grok(cfg, nodes)):
+            await self._test_nodes(cfg, nodes)
+
+    @staticmethod
+    def _apply_latency_cutoff(cfg: dict, nodes: list[PoolNode]) -> None:
+        """Hard ceiling: nodes slower than ``max_latency_ms`` never enter the
+        pool (marked unhealthy). 0 disables the cutoff. Covers both grok-probe
+        and delay latencies. Applied after the build-then-swap guard so it can
+        legitimately filter the pool down to 0 (a config decision, not a fault)."""
+        ceiling = cfg["max_latency_ms"]
+        if ceiling <= 0:
             return
-        await self._test_nodes(cfg, nodes)
+        dropped = 0
+        for node in nodes:
+            if (
+                node.healthy
+                and node.latency_ms is not None
+                and node.latency_ms > ceiling
+            ):
+                node.healthy = False
+                dropped += 1
+        if dropped:
+            logger.info(
+                "subscription latency cutoff dropped {} node(s) over {}ms",
+                dropped,
+                ceiling,
+            )
 
     async def _verify_with_grok(self, cfg: dict, nodes: list[PoolNode]) -> bool:
         """Probe every node with an authenticated grok request, updating
@@ -521,22 +591,25 @@ class SubscriptionManager:
 
     def _read_pool(self) -> PoolState | None:
         path = self.pool_path()
+        # os.replace makes writes atomic, so we never read a half-written file;
+        # the broad except also shields readers (e.g. the admin status endpoint)
+        # from a hand-edited or schema-incompatible pool file.
         try:
             with open(path, encoding="utf-8") as f:
                 payload = json.load(f)
-        except (OSError, ValueError):
+            nodes = [
+                PoolNode(
+                    node_id=n["node_id"],
+                    name=n["name"],
+                    listener_port=n["listener_port"],
+                    proxy_url=n["proxy_url"],
+                    latency_ms=n.get("latency_ms"),
+                    healthy=bool(n.get("healthy", False)),
+                )
+                for n in payload.get("nodes", [])
+            ]
+        except (OSError, ValueError, KeyError, TypeError):
             return None
-        nodes = [
-            PoolNode(
-                node_id=n["node_id"],
-                name=n["name"],
-                listener_port=n["listener_port"],
-                proxy_url=n["proxy_url"],
-                latency_ms=n.get("latency_ms"),
-                healthy=bool(n.get("healthy", False)),
-            )
-            for n in payload.get("nodes", [])
-        ]
         return PoolState(
             nodes=nodes,
             generated_at=payload.get("generated_at", 0),

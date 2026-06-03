@@ -247,6 +247,16 @@ async def runtime_status():
     )
 
 
+@router.get("/proxy/pool", tags=[_TAG_ADMIN_SYSTEM])
+async def subscription_pool_status():
+    """Live subscription pool status for the admin UI (read-only)."""
+    from app.control.proxy.subscription import get_subscription_manager
+
+    status = get_subscription_manager().pool_status()
+    status["mode"] = config.get_str("proxy.egress.mode", "direct")
+    return Response(content=orjson.dumps(status), media_type="application/json")
+
+
 @router.post("/sync", tags=[_TAG_ADMIN_SYSTEM])
 async def force_sync():
     from app.dataplane.account import _directory

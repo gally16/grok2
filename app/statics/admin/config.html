@@ -605,6 +605,7 @@ const SCHEMA_DEF = [
         title: '订阅代理池', titleKey: 'config.schema.groups.subscription',
         section: 'proxy.subscription',
         showIf: { path: 'proxy.egress.mode', values: ['subscription'] },
+        poolStatus: true,
         fields: [
           {
             key: 'urls', label: '订阅链接', type: 'textarea', wide: true,
@@ -631,8 +632,12 @@ const SCHEMA_DEF = [
             desc: '延迟 ≤ 此值且能连通的节点为主力档优先使用，超过则作为备用档。开启「真实 grok 探测」后此值比较的是 grok 探针往返耗时（含签名+跨境），默认 2000（2 秒）。',
           },
           {
+            key: 'max_latency_ms', label: '入池延迟上限（ms）', type: 'number',
+            desc: '延迟 > 此值的节点直接不进代理池（连备用都不算）。0 = 不限。开启「真实 grok 探测」时比较的是探针往返耗时，例：填 3000 表示只有 3 秒内能服务 grok 的节点才进池。',
+          },
+          {
             key: 'verify_with_grok', label: '真实 grok 探测', type: 'bool',
-            desc: '开启后不再用 gstatic 测活，改为拿真实账号经各节点发一次已认证的 grok 探针（不烧对话额度，但走完整 Cloudflare/风控链路）：回 200 才算可用、往返耗时即延迟，403/超时直接踢出池。拿不到可用账号时自动回退到下方 gstatic 测活。',
+            desc: '默认开启。用真实账号经各节点发一次已认证的 grok 探针（不烧对话额度，但走完整 Cloudflare/风控链路）：回 200 才算可用、往返耗时即延迟，403/超时直接踢出池。关闭则退回 gstatic 测活；开启但拿不到可用账号时也会自动回退 gstatic。',
           },
           {
             key: 'grok_test_timeout_ms', label: 'grok 探针超时（ms）', type: 'number',
@@ -1232,6 +1237,15 @@ function renderGroup(group, tabId) {
   const rows    = group.fields.map(f => renderRow(f, f.section || section, tabId));
   const titleEl = _el('div', { class: 'cfg-group-title' }, group.title || '');
   const wrap    = _el('div', { class: 'cfg-group' }, titleEl, ...rows);
+  // Live read-only pool status banner (subscription group only).
+  if (group.poolStatus) {
+    const banner = _el('div', {
+      id: 'pool-status-banner',
+      style: 'margin:6px 0 10px;padding:8px 12px;border-radius:8px;background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);font-size:13px;line-height:1.5;color:var(--text-secondary,#9aa);',
+    }, '代理池状态加载中…');
+    wrap.insertBefore(banner, titleEl.nextSibling);
+    setTimeout(refreshPoolStatus, 0);
+  }
   // Group-level conditional visibility (same mechanism as per-field showIf).
   if (group.showIf) {
     wrap._showIfSpec = group.showIf;
@@ -1340,6 +1354,30 @@ function _refreshDirtyState({ autoNormalizeSelects = true, changedPaths = null }
 }
 
 // ── Load config ────────────────────────────────────────────────────────────
+// ── Subscription pool status banner ────────────────────────────────────────
+let _poolStatusTimer = null;
+async function refreshPoolStatus() {
+  const el = document.getElementById('pool-status-banner');
+  if (!el) return;
+  try {
+    const d = await _api('GET', '/proxy/pool');
+    if (d.mode !== 'subscription') { el.textContent = '当前出口模式非「订阅代理池」，无池状态。'; return; }
+    if (!d.generated_at) { el.textContent = '代理池尚未生成（等待首次测活）。'; return; }
+    const t = new Date(d.generated_at).toLocaleString();
+    const method = d.verify_with_grok ? '真实 grok 探测' : 'gstatic 测活';
+    const cutoff = d.max_latency_ms > 0 ? `，入池上限 ${d.max_latency_ms}ms` : '';
+    el.textContent = `最近测活 ${t}（${method}${cutoff}）：${d.total} 个节点中 ${d.healthy} 个进入代理池（主力 ${d.primary} · 备用 ${d.backup}）。`;
+  } catch (e) {
+    el.textContent = `池状态获取失败：${e.message}`;
+  }
+}
+function _startPoolStatusPolling() {
+  if (_poolStatusTimer) clearInterval(_poolStatusTimer);
+  _poolStatusTimer = setInterval(() => {
+    if (document.getElementById('pool-status-banner')) refreshPoolStatus();
+  }, 15000);
+}
+
 async function load() {
   try {
     _cfg = await _api('GET', '/config');
@@ -1348,6 +1386,7 @@ async function load() {
     if (!SCHEMA.length) SCHEMA = buildSchema();
     renderAll();
     _refreshDirtyState({ autoNormalizeSelects: false });
+    _startPoolStatusPolling();
   } catch (e) {
     showToast(tr('config.loadFailed', { message: e.message }, `配置加载失败: ${e.message}`), 'error');
   }
