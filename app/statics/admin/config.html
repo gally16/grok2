@@ -547,8 +547,9 @@ const SCHEMA_DEF = [
               { value: 'direct', label: '直连', labelKey: 'config.schema.options.proxyMode.direct' },
               { value: 'single_proxy', label: '代理（固定）', labelKey: 'config.schema.options.proxyMode.singleProxy' },
               { value: 'proxy_pool', label: '代理（轮转）', labelKey: 'config.schema.options.proxyMode.proxyPool' },
+              { value: 'subscription', label: '订阅代理池（按账号轮换 IP）', labelKey: 'config.schema.options.proxyMode.subscription' },
             ],
-            desc: '控制出站流量代理策略。direct 为直连；single_proxy 使用固定代理；proxy_pool 在代理池中轮转。',
+            desc: '控制出站流量代理策略。direct 为直连；single_proxy 使用固定代理；proxy_pool 在代理池中轮转；subscription 拉取 Clash 订阅经 mihomo 测活+延迟优选，按账号粘性轮换 IP。',
             descKey: 'config.schema.fields.proxyMode.desc',
           },
           {
@@ -597,6 +598,53 @@ const SCHEMA_DEF = [
             desc: '跳过代理服务器 TLS 证书校验，仅在使用自签名证书的代理时启用。',
             descKey: 'config.schema.fields.skipSslVerify.desc',
             showIf: { path: 'proxy.egress.mode', values: ['single_proxy', 'proxy_pool'] },
+          },
+        ]
+      },
+      {
+        title: '订阅代理池', titleKey: 'config.schema.groups.subscription',
+        section: 'proxy.subscription',
+        showIf: { path: 'proxy.egress.mode', values: ['subscription'] },
+        fields: [
+          {
+            key: 'urls', label: '订阅链接', type: 'textarea', wide: true,
+            desc: 'Clash 格式订阅链接，每行一个，支持多个；节点自动合并去重。需配套部署 mihomo sidecar 容器。',
+          },
+          {
+            key: 'mihomo_api', label: 'mihomo 控制接口', type: 'text', wide: true,
+            desc: 'mihomo 的 external-controller 地址（docker 网络内），默认 http://mihomo:9090。',
+          },
+          {
+            key: 'mihomo_secret', label: 'mihomo 接口密钥', type: 'password',
+            desc: 'mihomo 控制接口 secret，须与 mihomo 配置一致；默认留空。',
+          },
+          {
+            key: 'mihomo_host', label: 'mihomo 主机名', type: 'text',
+            desc: '访问 mihomo 各节点 socks 端口的主机名（docker 服务名），默认 mihomo。',
+          },
+          {
+            key: 'listener_base_port', label: '节点端口起始值', type: 'number',
+            desc: 'mihomo 给每个节点开的本地 socks 监听起始端口（节点 i → 端口 base+i），默认 7100。',
+          },
+          {
+            key: 'primary_latency_ms', label: '主力档延迟阈值（ms）', type: 'number',
+            desc: '延迟 ≤ 此值且能连通的节点为主力档优先使用，超过则作为备用档。默认 1500。',
+          },
+          {
+            key: 'test_url', label: '测活目标 URL', type: 'text', wide: true,
+            desc: '节点测活/测延迟的目标地址，须返回 2xx/204。不要用 grok.com（裸请求回 403 会判失败）。默认 gstatic generate_204。',
+          },
+          {
+            key: 'test_timeout_ms', label: '测活超时（ms）', type: 'number',
+            desc: '单节点测活超时毫秒数，默认 5000。',
+          },
+          {
+            key: 'refresh_interval_sec', label: '订阅刷新间隔（秒）', type: 'number',
+            desc: '重新拉订阅+重生成配置+reload 的周期，默认 1800。',
+          },
+          {
+            key: 'test_interval_sec', label: '重测间隔（秒）', type: 'number',
+            desc: '仅重测现有节点延迟（不重拉订阅）的周期，默认 300。',
           },
         ]
       },
@@ -1168,6 +1216,13 @@ function renderGroup(group, tabId) {
   const rows    = group.fields.map(f => renderRow(f, f.section || section, tabId));
   const titleEl = _el('div', { class: 'cfg-group-title' }, group.title || '');
   const wrap    = _el('div', { class: 'cfg-group' }, titleEl, ...rows);
+  // Group-level conditional visibility (same mechanism as per-field showIf).
+  if (group.showIf) {
+    wrap._showIfSpec = group.showIf;
+    wrap.style.display = _evalShowIf(group.showIf) ? '' : 'none';
+    _conditionalRows.push(wrap);
+    _showIfPaths(group.showIf).forEach((path) => _addDependency(_showIfDeps, path, wrap));
+  }
   return wrap;
 }
 
