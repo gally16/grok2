@@ -628,10 +628,6 @@ const SCHEMA_DEF = [
             desc: 'mihomo 给每个节点开的本地 socks 监听起始端口（节点 i → 端口 base+i），默认 7100。',
           },
           {
-            key: 'primary_latency_ms', label: '主力档延迟阈值（ms）', type: 'number',
-            desc: '延迟 ≤ 此值且能连通的节点为主力档优先使用，超过则作为备用档。开启「真实 grok 探测」后此值比较的是 grok 探针往返耗时（含签名+跨境），默认 2000（2 秒）。',
-          },
-          {
             key: 'max_latency_ms', label: '入池延迟上限（ms）', type: 'number',
             desc: '延迟 > 此值的节点直接不进代理池（连备用都不算）。0 = 不限。开启「真实 grok 探测」时比较的是探针往返耗时，例：填 3000 表示只有 3 秒内能服务 grok 的节点才进池。',
           },
@@ -1366,7 +1362,7 @@ async function refreshPoolStatus() {
     const t = new Date(d.generated_at).toLocaleString();
     const method = d.verify_with_grok ? '真实 grok 探测' : 'gstatic 测活';
     const cutoff = d.max_latency_ms > 0 ? `，入池上限 ${d.max_latency_ms}ms` : '';
-    el.textContent = `最近测活 ${t}（${method}${cutoff}）：${d.total} 个节点中 ${d.healthy} 个进入代理池（主力 ${d.primary} · 备用 ${d.backup}）。`;
+    el.textContent = `最近测活 ${t}（${method}${cutoff}）：${d.total} 个节点中 ${d.healthy} 个进入代理池。`;
   } catch (e) {
     el.textContent = `池状态获取失败：${e.message}`;
   }

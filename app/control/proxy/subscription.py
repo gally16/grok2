@@ -381,36 +381,25 @@ class SubscriptionManager:
 
     def pool_status(self) -> dict:
         """Read-only snapshot of the live pool for the admin UI: when it was last
-        measured and how many nodes made it in (split into primary/backup tiers)."""
+        measured and how many nodes made it into the pool."""
         cfg = get_config()
-        primary_ceiling = cfg.get_int("proxy.subscription.primary_latency_ms", 2000)
         status = {
             "generated_at": 0,
             "total": 0,
             "healthy": 0,
-            "primary": 0,
-            "backup": 0,
             "verify_with_grok": cfg.get_bool(
                 "proxy.subscription.verify_with_grok", False
             ),
             "max_latency_ms": cfg.get_int("proxy.subscription.max_latency_ms", 0),
-            "primary_latency_ms": primary_ceiling,
         }
         state = self._read_pool()
         if state is None:
             return status
         healthy = [n for n in state.nodes if n.healthy]
-        primary = sum(
-            1
-            for n in healthy
-            if n.latency_ms is not None and n.latency_ms <= primary_ceiling
-        )
         status.update(
             generated_at=state.generated_at,
             total=len(state.nodes),
             healthy=len(healthy),
-            primary=primary,
-            backup=len(healthy) - primary,
         )
         return status
 

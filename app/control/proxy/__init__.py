@@ -61,8 +61,6 @@ class ProxyDirectory:
         # Pool cursor for PROXY_POOL mode: sticky routing with failure-driven rotate.
         # Incremented on node failure; all callers see the same cursor under _lock.
         self._pool_cursor: int = 0
-        # SUBSCRIPTION mode: nodes with latency <= this are the primary tier.
-        self._primary_latency_ms: int = 1500
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -79,10 +77,11 @@ class ProxyDirectory:
         res_url = cfg.get_str("proxy.egress.resource_proxy_url", "")
         base_pool = tuple(cfg.get_list("proxy.egress.proxy_pool", []))
         res_pool = tuple(cfg.get_list("proxy.egress.resource_proxy_pool", []))
-        primary_latency = cfg.get_int("proxy.subscription.primary_latency_ms", 1500)
         # Pool file mtime joins the signature so followers reload when the leader
         # rewrites the healthy-node pool (subscription mode).
-        pool_mtime = _subscription_pool_mtime() if egress_mode == EgressMode.SUBSCRIPTION else 0
+        pool_mtime = (
+            _subscription_pool_mtime() if egress_mode == EgressMode.SUBSCRIPTION else 0
+        )
         clearance = resolve_clearance_config(cfg)
         config_sig = (
             egress_mode.value,
@@ -91,7 +90,6 @@ class ProxyDirectory:
             res_url,
             base_pool,
             res_pool,
-            primary_latency,
             pool_mtime,
             cfg.get_str("proxy.clearance.flaresolverr_url", ""),
             clearance.cf_cookies,
@@ -137,7 +135,6 @@ class ProxyDirectory:
             self._clearance_mode = clearance_mode
             self._nodes = nodes
             self._resource_nodes = resource_nodes
-            self._primary_latency_ms = primary_latency
             self._pool_cursor = 0
             self._bundles = {
                 key: bundle.model_copy(update={"state": ClearanceBundleState.INVALID})
@@ -184,9 +181,7 @@ class ProxyDirectory:
         if self._egress_mode == EgressMode.SUBSCRIPTION and not proxy_url:
             from app.platform.errors import UpstreamError
 
-            raise UpstreamError(
-                "No healthy subscription egress available", status=503
-            )
+            raise UpstreamError("No healthy subscription egress available", status=503)
         affinity = proxy_url or "direct"
         clearance_host = _clearance_host(clearance_origin)
 
@@ -276,33 +271,23 @@ class ProxyDirectory:
     def _pick_subscription_node(
         self, nodes: list[EgressNode], account_id: str | None
     ) -> str | None:
-        """Latency-tiered, per-account-sticky selection.
+        """Per-account-sticky selection across all in-pool nodes.
 
-        Prefer the primary tier (latency <= threshold); fall back to backup
-        (reachable but slow) only when no primary node exists. Within a tier an
-        account sticks to one node via a stable hash, so the same account keeps
-        the same egress IP instead of hopping between them.
+        Every healthy node participates equally (no primary/backup tiering); the
+        latency cutoff already decided pool membership upstream. An account sticks
+        to one node via a stable hash so it keeps the same egress IP instead of
+        hopping between them.
         """
-        primary_ids = {
-            n.node_id
-            for n in nodes
-            if n.latency_ms is not None and n.latency_ms <= self._primary_latency_ms
-        }
-        primary = [n for n in nodes if n.node_id in primary_ids]
-        backup = [n for n in nodes if n.node_id not in primary_ids]
-        tier = primary or backup or nodes
-        # Order by stable node identity (NOT latency) so the per-account hash maps
-        # to the same node across retests — latency only decides tier membership,
-        # it must not reshuffle the mapping or accounts would hop IPs every retest.
-        tier = sorted(tier, key=lambda n: n.node_id)
+        # Order by stable node identity so the per-account hash maps to the same
+        # node across retests; the failure cursor steers an account elsewhere on
+        # retry, and stays stable while no failures occur → sticky IP.
+        pool = sorted(nodes, key=lambda n: n.node_id)
         if account_id:
             base = int(hashlib.md5(account_id.encode()).hexdigest(), 16)
-            # Add the failure cursor so a bad node steers the account elsewhere on
-            # retry; while no failures occur the cursor is stable → sticky IP.
-            idx = (base + self._pool_cursor) % len(tier)
+            idx = (base + self._pool_cursor) % len(pool)
         else:
-            idx = self._pool_cursor % len(tier)  # no identity → rotate across the tier
-        return tier[idx].proxy_url
+            idx = self._pool_cursor % len(pool)  # no identity → rotate across the pool
+        return pool[idx].proxy_url
 
     async def _get_or_build_bundle(
         self,
