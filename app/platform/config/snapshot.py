@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,9 @@ class ConfigSnapshot:
         if isinstance(val, list):
             return val
         if isinstance(val, str):
-            return [p.strip() for p in val.split(",") if p.strip()]
+            # Admin textarea list fields ("每行一个") persist as newline-joined
+            # strings; the legacy/env contract used commas. Accept both.
+            return [p.strip() for p in re.split(r"[,\n]", val) if p.strip()]
         return [val]
 
     async def update(self, patch: dict[str, Any]) -> None:

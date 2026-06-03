@@ -97,6 +97,25 @@ class SubscriptionScheduler:
     def is_running(self) -> bool:
         return any(not t.done() for t in self._tasks)
 
+    @staticmethod
+    def _source_sig() -> tuple:
+        """Fingerprint of the config fields that determine the node *set* (urls,
+        ports, host). A change here means the pool must be re-pulled + mihomo
+        reloaded (full refresh), not merely re-measured (retest)."""
+        cfg = get_config()
+        urls = tuple(
+            u for u in cfg.get_list("proxy.subscription.urls", []) if str(u).strip()
+        )
+        return (
+            urls,
+            cfg.get_str("proxy.subscription.mihomo_api", "http://mihomo:9090"),
+            cfg.get_str("proxy.subscription.mihomo_secret", ""),
+            cfg.get_str("proxy.subscription.mihomo_host", "mihomo"),
+            cfg.get_int("proxy.subscription.listener_base_port", 7100),
+            cfg.get_int("proxy.subscription.mihomo_controller_port", 9090),
+            cfg.get_str("proxy.subscription.mihomo_config_path", "/data/mihomo.yaml"),
+        )
+
     def start(self) -> None:
         if self.is_running():
             return
@@ -153,6 +172,7 @@ class SubscriptionScheduler:
         last_verify = get_config().get_bool(
             "proxy.subscription.verify_with_grok", False
         )
+        last_source = self._source_sig()
         waited = 0
         while not self._stop.is_set():
             interval = get_config().get_int("proxy.subscription.test_interval_sec", 300)
@@ -167,6 +187,22 @@ class SubscriptionScheduler:
             cur_verify = get_config().get_bool(
                 "proxy.subscription.verify_with_grok", False
             )
+            cur_source = self._source_sig()
+            # Source set changed (subscription added/edited, port/host moved) →
+            # re-pull + regenerate mihomo config now instead of waiting the full
+            # refresh interval; retest alone would never pick up new nodes.
+            if cur_source != last_source:
+                logger.info("subscription source config changed -> full refresh now")
+                last_source, last_verify, waited = cur_source, cur_verify, 0
+                try:
+                    await manager.refresh()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "subscription source-change refresh failed: error={}", exc
+                    )
+                continue
             toggled = cur_verify != last_verify
             if toggled:
                 logger.info(
