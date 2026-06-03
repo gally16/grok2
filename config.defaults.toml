@@ -110,8 +110,22 @@ test_interval_sec = 300
 test_url = "http://www.gstatic.com/generate_204"
 # 单节点测活超时（毫秒）
 test_timeout_ms = 5000
-# 主力档延迟阈值（毫秒）：<= 此值且能连通 = 主力，> 此值但能连通 = 备用
-primary_latency_ms = 1500
+# 用真实账号探测 grok 来判定节点（延迟+可用性全部以 grok 探针为准）。
+# 开启后不再跑上面的 mihomo delay/gstatic 测活——拿真实账号经该节点发一次
+# 已认证的 /rest/rate-limits 探针（不烧对话额度，但走完整 Cloudflare/风控链路）：
+# 回 200 = 可服务且 latency=探针往返耗时；403/超时 = 出口被风控，踢出池。
+# 拿不到可用账号 token 时自动回退到 mihomo delay，避免空池。
+verify_with_grok = false
+# grok 探针单次超时（毫秒）：跨境 + 签名 + grok 后端，比 gstatic 慢，给足余量
+grok_test_timeout_ms = 12000
+# grok 探针并发上限（受 statsig 签名机吞吐限制，不宜过高）
+grok_test_concurrency = 8
+# 探测时轮换使用的账号数（分摊同一账号从多 IP 探测的风险）
+grok_test_tokens = 4
+# 主力档延迟阈值（毫秒）：<= 此值且能连通 = 主力，> 此值但能连通 = 备用。
+# 注意 verify_with_grok 开启后此阈值比较的是 grok 探针往返耗时（含签名+跨境）：
+# <= 2000ms（2 秒）算主力，更慢但能连通的作备用。
+primary_latency_ms = 2000
 
 [proxy.clearance]
 # Cloudflare clearance 模式：none | manual | flaresolverr

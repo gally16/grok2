@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from urllib.parse import quote
 
 import aiohttp
+import orjson
 import yaml
 
 from app.platform.config.snapshot import get_config
@@ -28,6 +29,12 @@ from app.platform.runtime.clock import now_ms
 # Clash clients send this UA; some airports gate the subscription on it.
 _SUB_UA = "clash-verge/v2.0.0"
 _FETCH_TIMEOUT = 30
+
+# Authenticated grok probe used by verify_with_grok mode. The rate-limits API
+# is a *read* (does not consume the account's chat quota) yet traverses the full
+# statsig-signed + Cloudflare path, so a风控'd egress IP shows up as 403/challenge.
+_GROK_PROBE_URL = "https://grok.com/rest/rate-limits"
+_GROK_PROBE_PAYLOAD = orjson.dumps({"modelName": "fast"})
 
 
 @dataclass
@@ -186,6 +193,7 @@ class SubscriptionManager:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._probe_round = 0  # rotates the grok-verify token window across cycles
 
     # -- config accessors ---------------------------------------------------
 
@@ -211,6 +219,16 @@ class SubscriptionManager:
                 "proxy.subscription.test_url", "http://www.gstatic.com/generate_204"
             ),
             "test_timeout_ms": cfg.get_int("proxy.subscription.test_timeout_ms", 5000),
+            "verify_with_grok": cfg.get_bool(
+                "proxy.subscription.verify_with_grok", False
+            ),
+            "grok_timeout_ms": cfg.get_int(
+                "proxy.subscription.grok_test_timeout_ms", 12000
+            ),
+            "grok_concurrency": cfg.get_int(
+                "proxy.subscription.grok_test_concurrency", 8
+            ),
+            "grok_tokens": cfg.get_int("proxy.subscription.grok_test_tokens", 4),
         }
 
     @staticmethod
@@ -275,7 +293,7 @@ class SubscriptionManager:
             )
             await asyncio.sleep(2)  # let mihomo bring listeners/outbounds up
 
-            await self._test_nodes(cfg, nodes)
+            await self._run_test(cfg, nodes)
             healthy = sum(1 for n in nodes if n.healthy)
             # Build-then-swap: never overwrite a working pool with an empty one.
             # An all-unhealthy result usually means the mihomo control plane or
@@ -306,7 +324,7 @@ class SubscriptionManager:
             if state is None or not state.nodes:
                 return None
             prev_healthy = sum(1 for n in state.nodes if n.healthy)
-            await self._test_nodes(cfg, state.nodes)
+            await self._run_test(cfg, state.nodes)
             healthy = sum(1 for n in state.nodes if n.healthy)
             if healthy == 0 and prev_healthy > 0:
                 logger.warning(
@@ -353,6 +371,120 @@ class SubscriptionManager:
                         node.latency_ms, node.healthy = None, False
 
             await asyncio.gather(*(probe(n) for n in nodes))
+
+    async def _run_test(self, cfg: dict, nodes: list[PoolNode]) -> None:
+        """Measure each node's latency + availability in place.
+
+        With ``verify_with_grok`` on, probe via a real authenticated grok request
+        (the accurate "can this IP serve grok" signal). Falls back to the cheap
+        mihomo delay test when the toggle is off, or when no account tokens are
+        available (inconclusive) — so we never end up with an empty pool.
+        """
+        if cfg["verify_with_grok"] and await self._verify_with_grok(cfg, nodes):
+            return
+        await self._test_nodes(cfg, nodes)
+
+    async def _verify_with_grok(self, cfg: dict, nodes: list[PoolNode]) -> bool:
+        """Probe every node with an authenticated grok request, updating
+        ``latency_ms`` (probe round-trip) / ``healthy`` (HTTP 200) in place.
+
+        Returns False (inconclusive) when no usable account tokens exist, OR when
+        every node came back inconclusive (all sampled tokens turned out to be
+        bad accounts) — so the caller falls back to the delay test instead of
+        nuking the pool with an all-unhealthy result."""
+        from app.dataplane.account import get_account_directory
+
+        directory = await get_account_directory()
+        # Rotate which active accounts probe this round so the same few tokens
+        # aren't hammered across every node every cycle (429 / concentration risk).
+        self._probe_round += 1
+        tokens = directory.sample_active_tokens(
+            limit=max(1, cfg["grok_tokens"]), offset=self._probe_round
+        )
+        if not tokens:
+            logger.warning(
+                "subscription grok-verify skipped: no active account tokens; "
+                "falling back to delay test"
+            )
+            return False
+
+        timeout_s = cfg["grok_timeout_ms"] / 1000
+        sem = asyncio.Semaphore(max(1, cfg["grok_concurrency"]))
+
+        async def probe(offset: int, node: PoolNode) -> bool:
+            async with sem:
+                return await self._probe_node_grok(node, tokens, offset, timeout_s)
+
+        results = await asyncio.gather(*(probe(i, n) for i, n in enumerate(nodes)))
+        # Not one node got a definitive answer → the sampled accounts are all bad,
+        # not the nodes. Treat as inconclusive and fall back rather than writing an
+        # empty pool (which build-then-swap would then keep stale forever).
+        if not any(results):
+            logger.warning(
+                "subscription grok-verify inconclusive for all nodes (sampled "
+                "accounts all invalid); falling back to delay test"
+            )
+            return False
+        return True
+
+    @staticmethod
+    async def _probe_node_grok(
+        node: PoolNode, tokens: list[str], offset: int, timeout_s: float
+    ) -> bool:
+        """Send a rate-limits probe through this node, rotating tokens on an
+        account-level auth failure. Updates ``node.latency_ms`` / ``node.healthy``.
+
+        Returns True when the probe was *conclusive* (a 200, or a definitive
+        node/IP-level failure), False when inconclusive (every sampled token
+        failed auth — an account problem, so the node's prior state is left as-is).
+
+        Deliberately does NOT emit account/proxy feedback — this is a node test,
+        not a user request, and must not pollute either state machine.
+
+        Note: the lease carries only ``proxy_url`` (no per-node Cloudflare
+        clearance bundle). For the common subscription deploy — mihomo SOCKS
+        egress without per-node flaresolverr clearance — this matches what the
+        real request path produces; deployments relying on per-node CF clearance
+        could see a false-negative 403 here.
+        """
+        from app.control.proxy.models import ProxyLease
+        from app.dataplane.reverse.protocol.xai_usage import (
+            is_invalid_credentials_error,
+        )
+        from app.dataplane.reverse.transport.http import post_json
+
+        lease = ProxyLease(lease_id=f"probe-{node.node_id}", proxy_url=node.proxy_url)
+        n = len(tokens)
+        for k in range(n):
+            token = tokens[(offset + k) % n]
+            t0 = now_ms()
+            try:
+                await post_json(
+                    _GROK_PROBE_URL,
+                    token,
+                    _GROK_PROBE_PAYLOAD,
+                    lease=lease,
+                    timeout_s=timeout_s,
+                )
+                node.latency_ms, node.healthy = int(now_ms() - t0), True
+                return True
+            except Exception as exc:
+                # Account-level auth failure (expired/blocked token, or a bare 401
+                # with no recognizable body) → not the node's fault: next token.
+                # A 403 without a credential marker stays node-fault below: for a
+                # rotating-IP pool an unmarked 403 is far more likely a CF/IP block.
+                status = getattr(exc, "status", None)
+                if status == 401 or is_invalid_credentials_error(exc):
+                    continue
+                # 403 / 429 / 5xx / timeout / transport → this egress IP is unusable.
+                node.latency_ms, node.healthy = None, False
+                return True
+        # Every sampled token failed auth → inconclusive; leave prior state intact.
+        logger.debug(
+            "subscription grok-probe inconclusive (all tokens failed auth): node={}",
+            node.node_id,
+        )
+        return False
 
     def _write_config(self, config: dict) -> None:
         path = self._local_config_path()

@@ -628,15 +628,31 @@ const SCHEMA_DEF = [
           },
           {
             key: 'primary_latency_ms', label: '主力档延迟阈值（ms）', type: 'number',
-            desc: '延迟 ≤ 此值且能连通的节点为主力档优先使用，超过则作为备用档。默认 1500。',
+            desc: '延迟 ≤ 此值且能连通的节点为主力档优先使用，超过则作为备用档。开启「真实 grok 探测」后此值比较的是 grok 探针往返耗时（含签名+跨境），默认 2000（2 秒）。',
           },
           {
-            key: 'test_url', label: '测活目标 URL', type: 'text', wide: true,
-            desc: '节点测活/测延迟的目标地址，须返回 2xx/204。不要用 grok.com（裸请求回 403 会判失败）。默认 gstatic generate_204。',
+            key: 'verify_with_grok', label: '真实 grok 探测', type: 'bool',
+            desc: '开启后不再用 gstatic 测活，改为拿真实账号经各节点发一次已认证的 grok 探针（不烧对话额度，但走完整 Cloudflare/风控链路）：回 200 才算可用、往返耗时即延迟，403/超时直接踢出池。拿不到可用账号时自动回退到下方 gstatic 测活。',
           },
           {
-            key: 'test_timeout_ms', label: '测活超时（ms）', type: 'number',
-            desc: '单节点测活超时毫秒数，默认 5000。',
+            key: 'grok_test_timeout_ms', label: 'grok 探针超时（ms）', type: 'number',
+            desc: '仅「真实 grok 探测」生效。跨境+签名+grok 后端较慢，默认 12000。',
+          },
+          {
+            key: 'grok_test_concurrency', label: 'grok 探针并发', type: 'number',
+            desc: '仅「真实 grok 探测」生效。受 statsig 签名机吞吐限制，不宜过高，默认 8。',
+          },
+          {
+            key: 'grok_test_tokens', label: 'grok 探测轮换账号数', type: 'number',
+            desc: '仅「真实 grok 探测」生效。探测时轮换使用的账号数，分摊同一账号从多 IP 探测的风险，默认 4。',
+          },
+          {
+            key: 'test_url', label: '测活目标 URL（gstatic 回退）', type: 'text', wide: true,
+            desc: '未开启「真实 grok 探测」时的测活目标地址，须返回 2xx/204。不要用 grok.com（裸请求回 403 会判失败）。默认 gstatic generate_204。',
+          },
+          {
+            key: 'test_timeout_ms', label: '测活超时（ms，gstatic 回退）', type: 'number',
+            desc: '未开启「真实 grok 探测」时的单节点测活超时毫秒数，默认 5000。',
           },
           {
             key: 'refresh_interval_sec', label: '订阅刷新间隔（秒）', type: 'number',

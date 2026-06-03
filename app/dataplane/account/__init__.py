@@ -151,6 +151,31 @@ class AccountDirectory:
             selected_at=ts,
         )
 
+    def sample_active_tokens(self, limit: int = 8, *, offset: int = 0) -> list[str]:
+        """Best-effort read of up to *limit* active account tokens.
+
+        ``offset`` rotates the returned window across the full active set, so
+        repeated calls (e.g. periodic subscription node probes) spread load over
+        all accounts instead of always hitting the first *limit*.
+
+        Lock-free snapshot read for off-hot-path probes. Does not reserve, touch
+        inflight, or emit feedback — the caller must not feed results back into
+        the account state machine.
+        """
+        table = self._table
+        if table is None:
+            return []
+        active = [
+            table.get_token(idx)
+            for idx in table.iter_live_indices()
+            if table.is_active(idx)
+        ]
+        if not active:
+            return []
+        n = len(active)
+        start = offset % n
+        return [active[(start + i) % n] for i in range(min(limit, n))]
+
     async def reserve_any(
         self,
         pool_candidates: tuple[int, ...] | int,
@@ -284,7 +309,11 @@ class AccountDirectory:
 
             # Quota strategy may receive authoritative quota data from upstream
             # response headers; the random strategy ignores this entirely.
-            if strategy == "quota" and remaining is not None and reset_at_ms is not None:
+            if (
+                strategy == "quota"
+                and remaining is not None
+                and reset_at_ms is not None
+            ):
                 reset_s = int(reset_at_ms // 1000)
                 fb.apply_quota_update(table, idx, mode_id, remaining, reset_s)
 
