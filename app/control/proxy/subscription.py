@@ -39,10 +39,9 @@ _GROK_PROBE_PAYLOAD = orjson.dumps({"modelName": "fast"})
 # mihomo proxy-group name for the shared signer egress (see build_mihomo_config).
 # Dashed + prefixed so it can't collide with a real subscription node name.
 _SIGNER_GROUP = "GROK2API-AUTO"
-# url-test probe for that group. Deliberately grok.com (not a generic
-# connectivity URL): these nodes often reach grok while gstatic/google is
-# blocked, and a non-2xx here means the node is grok-unreachable/风控'd — exactly
-# what the signer must avoid. The group thus auto-selects a grok-usable node.
+# Health probe for that group. Deliberately grok.com (not a generic connectivity
+# URL): these nodes often reach grok while gstatic/google is blocked, so the
+# group health-checks against the only target that matters for the signer.
 _SIGNER_PROBE_URL = "https://grok.com/"
 
 
@@ -142,8 +141,9 @@ def build_mihomo_config(
 
     Each per-node listener binds directly to its upstream via the ``proxy`` field
     (traffic on that port egresses through exactly that node). The mixed-port
-    routes through the url-test group, which probes grok.com and lets mihomo pick
-    a currently grok-reachable node itself. Returns ``(config_dict, pool_nodes)``.
+    routes through a ``fallback`` group that probes grok.com and sticks to one
+    grok-reachable node (switching only on failure), giving external clients the
+    connection stability the signer needs. Returns ``(config_dict, pool_nodes)``.
     """
     listeners: list[dict] = []
     nodes: list[PoolNode] = []
@@ -180,11 +180,19 @@ def build_mihomo_config(
         [
             {
                 "name": _SIGNER_GROUP,
-                "type": "url-test",
+                # fallback (not url-test): stick to one reachable node and switch
+                # ONLY on failure. url-test churns by latency, which severs the
+                # signer's in-flight grok page load mid-handshake.
+                "type": "fallback",
                 "proxies": proxy_names,
                 "url": _SIGNER_PROBE_URL,
                 "interval": 300,
-                "tolerance": 50,
+                # grok behind CF answers 200 (ok) or 403/503 (challenge / under
+                # attack) — all mean the node reaches grok; the headless signer
+                # clears the JS challenge itself. Accept them so fallback treats
+                # the node as up and stays put. Connect failures/timeouts still
+                # fail the probe and roll to the next node.
+                "expected-status": "200/403/503",
                 "lazy": True,
             }
         ]
@@ -192,7 +200,7 @@ def build_mihomo_config(
         else []
     )
     config = {
-        # mixed-port routes through the url-test group (see rules) — the single
+        # mixed-port routes through the fallback group (see rules) — the single
         # egress that selection-unaware external clients (signer) can use.
         "mixed-port": listener_base_port - 1,
         "allow-lan": True,
