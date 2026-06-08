@@ -1235,10 +1235,17 @@ function renderGroup(group, tabId) {
   const wrap    = _el('div', { class: 'cfg-group' }, titleEl, ...rows);
   // Live read-only pool status banner (subscription group only).
   if (group.poolStatus) {
+    const text = _el('span', { id: 'pool-status-text' }, '代理池状态加载中…');
+    const btn = _el('button', {
+      id: 'pool-refresh-btn',
+      class: 'page-action-btn',
+      style: 'margin-left:12px;flex:none;cursor:pointer;',
+      onclick: triggerPoolRefresh,
+    }, '立即刷新并探活');
     const banner = _el('div', {
       id: 'pool-status-banner',
-      style: 'margin:6px 0 10px;padding:8px 12px;border-radius:8px;background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);font-size:13px;line-height:1.5;color:var(--text-secondary,#9aa);',
-    }, '代理池状态加载中…');
+      style: 'display:flex;align-items:center;gap:8px;margin:6px 0 10px;padding:8px 12px;border-radius:8px;background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);font-size:13px;line-height:1.5;color:var(--text-secondary,#9aa);',
+    }, text, btn);
     wrap.insertBefore(banner, titleEl.nextSibling);
     setTimeout(refreshPoolStatus, 0);
   }
@@ -1352,19 +1359,42 @@ function _refreshDirtyState({ autoNormalizeSelects = true, changedPaths = null }
 // ── Load config ────────────────────────────────────────────────────────────
 // ── Subscription pool status banner ────────────────────────────────────────
 let _poolStatusTimer = null;
+function _renderPoolStatus(el, d) {
+  if (d.mode !== 'subscription') { el.textContent = '当前出口模式非「订阅代理池」，无池状态。'; return; }
+  if (!d.generated_at) { el.textContent = '代理池尚未生成（等待首次测活）。'; return; }
+  const t = new Date(d.generated_at).toLocaleString();
+  const method = d.verify_with_grok ? '真实 grok 探测' : 'gstatic 测活';
+  const cutoff = d.max_latency_ms > 0 ? `，入池上限 ${d.max_latency_ms}ms` : '';
+  el.textContent = `最近测活 ${t}（${method}${cutoff}）：${d.total} 个节点中 ${d.healthy} 个进入代理池。`;
+}
 async function refreshPoolStatus() {
-  const el = document.getElementById('pool-status-banner');
+  const el = document.getElementById('pool-status-text');
   if (!el) return;
   try {
-    const d = await _api('GET', '/proxy/pool');
-    if (d.mode !== 'subscription') { el.textContent = '当前出口模式非「订阅代理池」，无池状态。'; return; }
-    if (!d.generated_at) { el.textContent = '代理池尚未生成（等待首次测活）。'; return; }
-    const t = new Date(d.generated_at).toLocaleString();
-    const method = d.verify_with_grok ? '真实 grok 探测' : 'gstatic 测活';
-    const cutoff = d.max_latency_ms > 0 ? `，入池上限 ${d.max_latency_ms}ms` : '';
-    el.textContent = `最近测活 ${t}（${method}${cutoff}）：${d.total} 个节点中 ${d.healthy} 个进入代理池。`;
+    _renderPoolStatus(el, await _api('GET', '/proxy/pool'));
   } catch (e) {
     el.textContent = `池状态获取失败：${e.message}`;
+  }
+}
+async function triggerPoolRefresh() {
+  const btn = document.getElementById('pool-refresh-btn');
+  const el = document.getElementById('pool-status-text');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = '刷新中…';
+  if (el) el.textContent = '正在拉取订阅并对所有节点探活，请稍候（可能需要十几秒）…';
+  try {
+    const d = await _api('POST', '/proxy/pool/refresh');
+    if (el) _renderPoolStatus(el, d);
+    showToast(d.refreshed ? '订阅已刷新，节点探活完成' : (d.message || '刷新未生效'),
+      d.refreshed ? 'success' : 'error');
+  } catch (e) {
+    showToast(`刷新失败：${e.message}`, 'error');
+    if (el) el.textContent = `刷新失败：${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
   }
 }
 function _startPoolStatusPolling() {

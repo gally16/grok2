@@ -259,6 +259,38 @@ async def subscription_pool_status():
     return Response(content=orjson.dumps(status), media_type="application/json")
 
 
+@router.post("/proxy/pool/refresh", tags=[_TAG_ADMIN_SYSTEM])
+async def subscription_pool_refresh():
+    """Manually pull all subscriptions, rebuild, reload mihomo and probe nodes."""
+    from app.control.proxy.subscription import get_subscription_manager
+    from app.dataplane.proxy.adapters.headers import signer_health
+
+    mode = config.get_str("proxy.egress.mode", "direct")
+    if mode != "subscription":
+        return Response(
+            content=orjson.dumps(
+                {
+                    "refreshed": False,
+                    "mode": mode,
+                    "message": "当前出口模式非「订阅代理池」",
+                }
+            ),
+            media_type="application/json",
+        )
+
+    mgr = get_subscription_manager()
+    state = await mgr.refresh()
+    status = mgr.pool_status()
+    status["mode"] = mode
+    status["signer"] = signer_health()
+    status["refreshed"] = state is not None
+    if state is None:
+        status["message"] = (
+            "刷新未生效：订阅为空、无可用节点或测活全部失败（已保留上次结果）"
+        )
+    return Response(content=orjson.dumps(status), media_type="application/json")
+
+
 @router.post("/sync", tags=[_TAG_ADMIN_SYSTEM])
 async def force_sync():
     from app.dataplane.account import _directory
