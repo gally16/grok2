@@ -19,9 +19,9 @@ jobs:
       matrix:
         include:
           # 重点 2：将镜像前缀改为 ghcr.io/你的GitHub用户名小写
-          - image: ghcr.io/${{ github.repository_owner }}/grok2api
+          - image: ghcr.io/${{ github.repository_owner }}/grok2
             context: .
-          - image: ghcr.io/${{ github.repository_owner }}/statsig-signer
+          - image: ghcr.io/${{ github.repository_owner }}/statsig-signer2
             context: statsig-signer
 
     steps:
